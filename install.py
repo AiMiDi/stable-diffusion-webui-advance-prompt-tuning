@@ -1,7 +1,7 @@
 import os
 import launch
 
-if not launch.is_installed("aitextgen"):
+if not launch.is_installed("scikit_learn"):
     launch.run_pip("install scikit_learn", "requirements for Advance Prompt Tuning")
 
 
