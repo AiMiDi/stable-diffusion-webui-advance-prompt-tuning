@@ -172,7 +172,7 @@ def create_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, over
 
     uc_embedding = AdvancePromptTuning(uc_vec, uc_name)
     uc_embedding.step = 0
-    uc_embedding.save(fn)
+    uc_embedding.save(uc_fn)
 
     return fn, uc_fn
 
