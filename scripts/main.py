@@ -11,8 +11,6 @@ from webui import wrap_gradio_gpu_call
 
 
 def create_tabs(params:UiTrainTabParams):
-    apt_output = ''
-    apt_outcome = ''
     with gr.Tab(label="Advance prompt tuning") as advance_prompt_tuning_tab:
         with gr.Row().style(equal_height=False):
             gr.HTML(value="<p style='margin-bottom: 0.7em'>See <b><a href=\"=https://github.com/AiMiDi/stable-diffusion-webui-advance-prompt-tuning\">wiki</a></b> for detailed explanation.</p>")
@@ -78,10 +76,10 @@ def create_tabs(params:UiTrainTabParams):
                         interrupt_training = gr.Button(value="Interrupt")
                         train_apt_embedding = gr.Button(
                             value="Train APT Embedding", variant='primary')
-
+        apt_output = gr.Text(elem_id="apt_output", value="", show_label=False)
         create_apt_embedding.click(
             fn=apt_ui.create_advance_prompt_tuning_embedding,
-            _js="create_apt_embedding",
+            #_js="create_apt_embedding",
             inputs=[
                 apt_new_embedding_name,
                 apt_nvpt,
@@ -91,12 +89,13 @@ def create_tabs(params:UiTrainTabParams):
             ],
             outputs=[
                 train_apt_embedding_name,
+                apt_output
             ]
         )
 
         train_apt_embedding.click(
             fn=wrap_gradio_gpu_call(apt_ui.train_advance_prompt_tuning_embedding, extra_outputs=[gr.update()]),
-            _js="start_apt_tuning",
+            #_js="start_apt_tuning",
             inputs=[
                 train_apt_embedding_name,
                 embedding_learn_rate,
@@ -115,6 +114,7 @@ def create_tabs(params:UiTrainTabParams):
                 *params.txt2img_preview_params
             ],
             outputs=[
+                apt_output
             ]
         )
 
