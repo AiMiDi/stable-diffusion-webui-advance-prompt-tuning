@@ -1,3 +1,4 @@
+import imghdr
 import os
 import numpy as np
 import PIL
@@ -41,21 +42,24 @@ class PersonalizedBase(Dataset):
 
         self.image_paths = [os.path.join(data_root, file_path) for file_path in os.listdir(data_root)]
         print("Preparing dataset...")
+
+        imgType_list = {'jpg', 'bmp', 'png', 'jpeg', 'jfif'}
         for path in tqdm.tqdm(self.image_paths):
-            image = Image.open(path)
-            image = image.convert('RGB')
+            if imghdr.what(path) in imgType_list:
+                image = Image.open(path)
+                image = image.convert('RGB')
 
-            filename = os.path.basename(path)
-            filename_tokens = os.path.splitext(filename)[0]
-            filename_tokens = re_tag.findall(filename_tokens)
+                filename = os.path.basename(path)
+                filename_tokens = os.path.splitext(filename)[0]
+                filename_tokens = re_tag.findall(filename_tokens)
 
-            torchdata = (TR(image)*2.-1.).to(device=device, dtype=torch.float32)
+                torchdata = (TR(image)*2.-1.).to(device=device, dtype=torch.float32)
 
-            timg = torchdata.unsqueeze(dim=0)
-            init_latent = model.get_first_stage_encoding(model.encode_first_stage(timg)).squeeze()
-            init_latent = init_latent.to(devices.cpu)
+                timg = torchdata.unsqueeze(dim=0)
+                init_latent = model.get_first_stage_encoding(model.encode_first_stage(timg)).squeeze()
+                init_latent = init_latent.to(devices.cpu)
 
-            self.dataset.append((timg, init_latent, filename_tokens))
+                self.dataset.append((timg, init_latent, filename_tokens))
 
         self.length = len(self.dataset) * repeats
 
