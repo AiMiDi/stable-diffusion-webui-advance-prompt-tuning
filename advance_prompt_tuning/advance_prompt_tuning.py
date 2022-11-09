@@ -8,9 +8,12 @@ import html
 import datetime
 from torch.nn import functional as torch_functional
 
-from modules import shared, devices, sd_hijack, processing, sd_models
+from PIL import PngImagePlugin
+from modules import shared, devices, sd_hijack, processing, sd_models, images
 import advance_prompt_tuning.dataset as apt_dataset
-from modules.conv_next.interface import XPDiscriminator
+from conv_next.interface import XPDiscriminator
+from modules.textual_inversion.textual_inversion import write_loss
+from modules.textual_inversion.image_embedding import embedding_to_b64, insert_image_data_embed, caption_image_overlay
 
 class AdvancePromptTuning:
     def __init__(self, vec, name, step=None):
@@ -135,7 +138,7 @@ class AdvancePromptTuningDatabase:
         return None, None
 
 
-def create_embedding(name, num_vectors_per_token, init_text='*'):
+def create_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, overwrite_old, init_text='*'):
     cond_model = shared.sd_model.cond_stage_model
     embedding_layer = cond_model.wrapped.transformer.text_model.embeddings
 
@@ -146,19 +149,63 @@ def create_embedding(name, num_vectors_per_token, init_text='*'):
     for i in range(num_vectors_per_token):
         vec[i] = embedded[i * int(embedded.shape[0]) // num_vectors_per_token]
 
+    uc_ids = cond_model.tokenizer(init_text, max_length=num_vectors_uc_per_token, return_tensors="pt", add_special_tokens=False)["input_ids"]
+    uc_embedded = embedding_layer.token_embedding.wrapped(uc_ids.to(devices.device)).squeeze(0)
+    uc_vec = torch.zeros((num_vectors_uc_per_token, embedded.shape[1]), device=devices.device)
+
+    for i in range(num_vectors_uc_per_token):
+        uc_vec[i] = uc_embedded[i * int(uc_embedded.shape[0]) // num_vectors_uc_per_token]
+
+    # Remove illegal characters from name.
+    name = "".join( x for x in name if (x.isalnum() or x in "._- "))
+    uc_name = name+'-uc'
+
     fn = os.path.join(shared.cmd_opts.embeddings_dir, f"{name}.pt")
-    assert not os.path.exists(fn), f"file {fn} already exists"
+    uc_fn = os.path.join(shared.cmd_opts.embeddings_dir, f"{uc_name}.pt")
+    if not overwrite_old:
+        assert not os.path.exists(fn), f"file {fn} already exists"
+        assert not os.path.exists(uc_fn), f"file {fn} already exists"
 
     embedding = AdvancePromptTuning(vec, name)
     embedding.step = 0
     embedding.save(fn)
 
-    return fn
+    uc_embedding = AdvancePromptTuning(uc_vec, uc_name)
+    uc_embedding.step = 0
+    uc_embedding.save(fn)
+
+    return fn, uc_fn
 
 
-def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, log_directory, steps, create_image_every, save_embedding_every, template_file,
-                    classifier_path, img_size):
-    assert embedding_name, 'embedding not selected'
+def validate_train_inputs(model_name, learn_rate, cfg_scale, data_root, template_file, steps, save_model_every, create_image_every, log_directory, name="embedding"):
+    assert model_name, f"{name} not selected"
+    assert learn_rate, "Learning rate is empty or 0"
+    assert cfg_scale, "Negtive scale is empty or 0"
+    assert data_root, "Dataset directory is empty"
+    assert os.path.isdir(data_root), "Dataset directory doesn't exist"
+    assert os.listdir(data_root), "Dataset directory is empty"
+    assert template_file, "Prompt template file is empty"
+    assert os.path.isfile(template_file), "Prompt template file doesn't exist"
+    assert steps, "Max steps is empty or 0"
+    assert isinstance(steps, int), "Max steps must be integer"
+    assert steps > 0 , "Max steps must be positive"
+    assert isinstance(save_model_every, int), "Save {name} must be integer"
+    assert save_model_every >= 0 , "Save {name} must be positive or 0"
+    assert isinstance(create_image_every, int), "Create image must be integer"
+    assert create_image_every >= 0 , "Create image must be positive or 0"
+    if save_model_every or create_image_every:
+        assert log_directory, "Log directory is empty"
+
+
+def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, template_file, steps, save_embedding_every, create_image_every,
+                    classifier_path, log_directory, training_width, training_height, save_image_with_stored_embedding, preview_from_txt2img,
+                    preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height):
+    
+    save_embedding_every = save_embedding_every or 0
+    create_image_every = create_image_every or 0
+
+    validate_train_inputs(embedding_name, learn_rate, cfg_scale, data_root, template_file, steps, save_embedding_every, create_image_every, 
+                   log_directory, embedding_name)
 
     shared.state.textinfo = "Initializing textual inversion training..."
     shared.state.job_count = steps
@@ -173,18 +220,29 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, log_direct
     else:
         embedding_dir = None
 
+
     if create_image_every > 0:
         images_dir = os.path.join(log_directory, "images")
         os.makedirs(images_dir, exist_ok=True)
     else:
         images_dir = None
 
+    if create_image_every > 0 and save_image_with_stored_embedding:
+        images_embeds_dir = os.path.join(log_directory, "image_embeddings")
+        os.makedirs(images_embeds_dir, exist_ok=True)
+    else:
+        images_embeds_dir = None
+
     cond_model = shared.sd_model.cond_stage_model
+    unload = shared.opts.unload_models_when_training
 
     shared.state.textinfo = f"Preparing dataset from {html.escape(data_root)}..."
     with torch.autocast("cuda"):
-        ds = apt_dataset.PersonalizedBase(data_root=data_root, size=img_size, placeholder_token=embedding_name,
-                            model=shared.sd_model, device=devices.device, template_file=template_file, width=img_size, height=img_size)
+        ds = apt_dataset.PersonalizedBase(data_root=data_root, placeholder_token=embedding_name,
+                            model=shared.sd_model, device=devices.device, template_file=template_file, width=training_width, height=training_height)
+
+    if unload:
+        shared.sd_model.first_stage_model.to(devices.cpu)
 
     hijack = sd_hijack.model_hijack
 
@@ -194,7 +252,7 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, log_direct
     embedding_uc.vec.requires_grad = True
 
     optimizer = torch.optim.AdamW([embedding.vec, embedding_uc.vec], lr=learn_rate)
-    schedule = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3000, gamma=0.3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3000, gamma=0.3)
 
     disc = XPDiscriminator(classifier_path) if (classifier_path is not None) and os.path.exists(classifier_path) else None
 
@@ -213,7 +271,8 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, log_direct
         return embedding, filename
 
     pbar = tqdm.tqdm(enumerate(ds), total=steps-ititial_step)
-    for i, (timg, x, text) in pbar:
+    for i, entries in pbar:
+        timg, x, text = entries
         embedding.step = i + ititial_step
         embedding_uc.step = i + ititial_step
 
@@ -248,36 +307,92 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, log_direct
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            schedule.step()
+            scheduler.step()
 
-        pbar.set_description(f"loss: {losses.mean():.7f}, grad:{embedding.vec.grad.mean():.7f}")
+        epoch_num = embedding.step // len(ds)
+        epoch_step = embedding.step % len(ds)
 
-        if embedding.step > 0 and embedding_dir is not None and embedding.step % save_embedding_every == 0:
+        pbar.set_description(f"[Epoch {epoch_num}: {epoch_step+1}/{len(ds)}]loss: {losses.mean():.7f}")
+
+        steps_done = embedding.step + 1
+
+        if embedding_dir is not None and steps_done % save_embedding_every == 0:
             last_saved_file = os.path.join(embedding_dir, f'{embedding_name}-{embedding.step}.pt')
             embedding.save(last_saved_file)
             last_saved_file = os.path.join(embedding_dir, f'{embedding_name}-uc-{embedding.step}.pt')
             embedding_uc.save(last_saved_file)
 
-        if embedding.step > 0 and images_dir is not None and embedding.step % create_image_every == 0:
-            last_saved_image = os.path.join(images_dir, f'{embedding_name}-{embedding.step}.png')
+        write_loss(log_directory, "textual_inversion_loss.csv", embedding.step, len(ds), {
+            "loss": f"{losses.mean():.7f}",
+            "learn_rate": scheduler.get_last_lr()
+        })
+
+        if images_dir is not None and steps_done % create_image_every == 0:
+            forced_filename = f'{embedding_name}-{steps_done}'
+            last_saved_image = os.path.join(images_dir, forced_filename)
+
+            shared.sd_model.first_stage_model.to(devices.device)
 
             p = processing.StableDiffusionProcessingTxt2Img(
                 sd_model=shared.sd_model,
-                prompt=text,
-                steps=20,
                 do_not_save_grid=True,
                 do_not_save_samples=True,
-                negative_prompt=text.replace(ds.placeholder_token, ds.placeholder_token+'-uc'),
-                cfg_scale=cfg_scale,
+                do_not_reload_embeddings=True,
             )
+
+            if preview_from_txt2img:
+                p.prompt = preview_prompt
+                p.negative_prompt = preview_negative_prompt
+                p.steps = preview_steps
+                p.sampler_index = preview_sampler_index
+                p.cfg_scale = preview_cfg_scale
+                p.seed = preview_seed
+                p.width = preview_width
+                p.height = preview_height
+            else:
+                p.prompt = entries[0].cond_text
+                p.steps = 20
+                p.width = training_width
+                p.height = training_height
+
+            preview_text = p.prompt
 
             processed = processing.process_images(p)
             image = processed.images[0]
 
-            shared.state.current_image = image
-            image.save(last_saved_image)
+            if unload:
+                shared.sd_model.first_stage_model.to(devices.cpu)
 
-            last_saved_image += f", prompt: {text}"
+            shared.state.current_image = image
+
+            if save_image_with_stored_embedding and os.path.exists(last_saved_file) and embedding_yet_to_be_embedded:
+
+                last_saved_image_chunks = os.path.join(images_embeds_dir, f'{embedding_name}-{steps_done}.png')
+
+                info = PngImagePlugin.PngInfo()
+                data = torch.load(last_saved_file)
+                info.add_text("sd-ti-embedding", embedding_to_b64(data))
+
+                title = "<{}>".format(data.get('name', '???'))
+
+                try:
+                    vectorSize = list(data['string_to_param'].values())[0].shape[0]
+                except Exception as e:
+                    vectorSize = '?'
+
+                checkpoint = sd_models.select_checkpoint()
+                footer_left = checkpoint.model_name
+                footer_mid = '[{}]'.format(checkpoint.hash)
+                footer_right = '{}v {}s'.format(vectorSize, steps_done)
+
+                captioned_image = caption_image_overlay(image, title, footer_left, footer_mid, footer_right)
+                captioned_image = insert_image_data_embed(captioned_image, data)
+
+                captioned_image.save(last_saved_image_chunks, "PNG", pnginfo=info)
+                embedding_yet_to_be_embedded = False
+
+            last_saved_image, last_text_info = images.save_image(image, images_dir, "", p.seed, p.prompt, shared.opts.samples_format, processed.infotexts[0], p=p, forced_filename=forced_filename, save_to_dirs=False)
+            last_saved_image += f", prompt: {preview_text}"
 
         shared.state.job_no = embedding.step
 
