@@ -6,8 +6,8 @@ import advance_prompt_tuning.advance_prompt_tuning as apt
 from modules import sd_hijack, shared
 
 
-def create_advance_prompt_tuning_embedding(name, nvpt, nvucpt, overwrite_old, initialization_text):
-    filename, uc_filename = apt.create_apt_embedding(name, nvpt, nvucpt, overwrite_old, initialization_text)
+def create_advance_prompt_tuning_embedding(name, nvpt, nvucpt, use_negative, overwrite_old, initialization_text):
+    filename, uc_filename = apt.create_apt_embedding(name, nvpt, nvucpt, use_negative, overwrite_old, initialization_text)
 
     sd_hijack.model_hijack.embedding_db.load_textual_inversion_embeddings()
     

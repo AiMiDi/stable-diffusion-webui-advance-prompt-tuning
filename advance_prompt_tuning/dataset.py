@@ -1,4 +1,3 @@
-import imghdr
 import os
 import numpy as np
 import PIL
@@ -20,14 +19,15 @@ class DatasetEntry:
         self.filename = filename
         self.latent = latent
         self.filename_text = filename_text
+        self.timg = timg
         self.cond = None
         self.cond_text = None
-        self.timg = timg
 
 
 class PersonalizedBase(Dataset):
-    def __init__(self, data_root, repeats=100, flip_p=0.5, placeholder_token="*", width=512, height=512, model=None, device=None, template_file=None, include_cond=False, batch_size=1):
+    def __init__(self, data_root, width, height, repeats, flip_p=0.5, placeholder_token="*", model=None, device=None, template_file=None, include_cond=False, batch_size=1):
         re_word = re.compile(shared.opts.dataset_filename_word_regex) if len(shared.opts.dataset_filename_word_regex) > 0 else None
+
         self.placeholder_token = placeholder_token
 
         self.batch_size = batch_size
@@ -43,22 +43,21 @@ class PersonalizedBase(Dataset):
         self.lines = lines
 
         assert data_root, 'dataset directory not specified'
-        assert os.path.isdir(data_root), "Dataset directory doesn't exist"
-        assert os.listdir(data_root), "Dataset directory is empty"
 
-        cond_model = shared.sd_model.cond_stage_model
-
+        # rasize and crop, not change the image ratio
         TR = transforms.Compose([
-            transforms.Resize(min(self.width, self.height)),
+            transforms.Resize(min(self.width, self.height), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(min(self.width, self.height)),
             transforms.ToTensor()
         ])
+
+        cond_model = shared.sd_model.cond_stage_model
 
         self.image_paths = [os.path.join(data_root, file_path) for file_path in os.listdir(data_root)]
         print("Preparing dataset...")
         for path in tqdm.tqdm(self.image_paths):
             try:
-                image = Image.open(path).convert('RGB').resize((self.width, self.height), PIL.Image.BICUBIC)
+                image = Image.open(path).convert('RGB')
             except Exception:
                 continue
 
@@ -75,12 +74,13 @@ class PersonalizedBase(Dataset):
                     tokens = re_word.findall(filename_text)
                     filename_text = (shared.opts.dataset_filename_join_string or "").join(tokens)
 
-            torchdata = (TR(image)*2.-1.).to(device=device, dtype=torch.float32)
+            torchdata = (TR(image) * 2. - 1.).to(device=device, dtype=torch.float32)
+
             timg = torchdata.unsqueeze(dim=0)
             init_latent = model.get_first_stage_encoding(model.encode_first_stage(timg)).squeeze()
             init_latent = init_latent.to(devices.cpu)
 
-            entry = DatasetEntry(filename=path, filename_text=filename_text, latent=init_latent, timg = timg)
+            entry = DatasetEntry(filename=path, filename_text=filename_text, latent=init_latent, timg=timg)
 
             if include_cond:
                 entry.cond_text = self.create_text(filename_text)
@@ -88,15 +88,15 @@ class PersonalizedBase(Dataset):
 
             self.dataset.append(entry)
 
-        assert len(self.dataset) > 0, "No images have been found in the dataset."
+        assert len(self.dataset) >= 1, "No images have been found in the dataset." # support one-shot training
         self.length = len(self.dataset) * repeats // batch_size
 
-        self.dataset_length = len(self.dataset)
+        self.initial_indexes = np.arange(len(self.dataset))
         self.indexes = None
         self.shuffle()
 
     def shuffle(self):
-        self.indexes = np.random.permutation(self.dataset_length)
+        self.indexes = self.initial_indexes[torch.randperm(self.initial_indexes.shape[0])] if len(self.dataset)>1 else self.initial_indexes
 
     def create_text(self, filename_text):
         text = random.choice(self.lines)
