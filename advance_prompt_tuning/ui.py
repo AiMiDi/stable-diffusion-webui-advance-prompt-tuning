@@ -7,7 +7,7 @@ from modules import sd_hijack, shared
 
 
 def create_advance_prompt_tuning_embedding(name, nvpt, nvucpt, overwrite_old, initialization_text):
-    filename, uc_filename = apt.create_embedding(name, nvpt, nvucpt, overwrite_old, initialization_text)
+    filename, uc_filename = apt.create_apt_embedding(name, nvpt, nvucpt, overwrite_old, initialization_text)
 
     sd_hijack.model_hijack.embedding_db.load_textual_inversion_embeddings()
     
@@ -19,7 +19,7 @@ def train_advance_prompt_tuning_embedding(*args):
     try:
         sd_hijack.undo_optimizations()
 
-        embedding, filename = apt.train_embedding(*args)
+        embedding, filename = apt.train_apt_embedding(*args)
 
         res = f"""
 Training {'interrupted' if shared.state.interrupted else 'finished'} at {embedding.step} steps.

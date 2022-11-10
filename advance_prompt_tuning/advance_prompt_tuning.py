@@ -8,12 +8,13 @@ import html
 import datetime
 from torch.nn import functional as torch_functional
 
-from PIL import PngImagePlugin
+from PIL import Image, PngImagePlugin
 from modules import shared, devices, sd_hijack, processing, sd_models, images
 import advance_prompt_tuning.dataset as apt_dataset
 from conv_next.interface import XPDiscriminator
-from modules.textual_inversion.textual_inversion import write_loss
-from modules.textual_inversion.image_embedding import embedding_to_b64, insert_image_data_embed, caption_image_overlay
+from modules.textual_inversion.learn_schedule import LearnRateScheduler
+from modules.textual_inversion.textual_inversion import save_embedding, write_loss
+from modules.textual_inversion.image_embedding import embedding_from_b64, embedding_to_b64, extract_image_data_embed, insert_image_data_embed, caption_image_overlay
 
 class AdvancePromptTuning:
     def __init__(self, vec, name, step=None):
@@ -83,7 +84,18 @@ class AdvancePromptTuningDatabase:
         def process_file(path, filename):
             name = os.path.splitext(filename)[0]
 
-            data = torch.load(path, map_location="cpu")
+            data = []
+
+            if os.path.splitext(filename.upper())[-1] in ['.PNG', '.WEBP', '.JXL', '.AVIF']:
+                embed_image = Image.open(path)
+                if hasattr(embed_image, 'text') and 'sd-ti-embedding' in embed_image.text:
+                    data = embedding_from_b64(embed_image.text['sd-ti-embedding'])
+                    name = data.get('name', name)
+                else:
+                    data = extract_image_data_embed(embed_image)
+                    name = data.get('name', name)
+            else:
+                data = torch.load(path, map_location="cpu")
 
             # textual inversion embeddings
             if 'string_to_param' in data:
@@ -105,7 +117,7 @@ class AdvancePromptTuningDatabase:
             vec = emb.detach().to(devices.device, dtype=torch.float32)
             embedding = AdvancePromptTuning(vec, name)
             embedding.step = data.get('step', None)
-            embedding.sd_checkpoint = data.get('hash', None)
+            embedding.sd_checkpoint = data.get('sd_checkpoint', None)
             embedding.sd_checkpoint_name = data.get('sd_checkpoint_name', None)
             self.register_embedding(embedding, shared.sd_model)
 
@@ -123,6 +135,7 @@ class AdvancePromptTuningDatabase:
                 continue
 
         print(f"Loaded a total of {len(self.word_embeddings)} textual inversion embeddings.")
+        print("Embeddings:", ', '.join(self.word_embeddings.keys()))
 
     def find_embedding_at_position(self, tokens, offset):
         token = tokens[offset]
@@ -138,9 +151,12 @@ class AdvancePromptTuningDatabase:
         return None, None
 
 
-def create_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, overwrite_old, init_text='*'):
+def create_apt_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, overwrite_old, init_text='*'):
     cond_model = shared.sd_model.cond_stage_model
     embedding_layer = cond_model.wrapped.transformer.text_model.embeddings
+
+    with devices.autocast():
+        cond_model([""])  # will send cond model to GPU if lowvram/medvram is active
 
     ids = cond_model.tokenizer(init_text, max_length=num_vectors_per_token, return_tensors="pt", add_special_tokens=False)["input_ids"]
     embedded = embedding_layer.token_embedding.wrapped(ids.to(devices.device)).squeeze(0)
@@ -177,10 +193,12 @@ def create_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, over
     return fn, uc_fn
 
 
-def validate_train_inputs(model_name, learn_rate, cfg_scale, data_root, template_file, steps, save_model_every, create_image_every, log_directory, name="embedding"):
+def validate_train_inputs(model_name, learn_rate, cfg_scale, batch_size, data_root, template_file, steps, save_model_every, create_image_every, log_directory, name="embedding"):
     assert model_name, f"{name} not selected"
     assert learn_rate, "Learning rate is empty or 0"
     assert cfg_scale, "Negtive scale is empty or 0"
+    assert isinstance(batch_size, int), "Batch size must be integer"
+    assert batch_size > 0, "Batch size must be positive"
     assert data_root, "Dataset directory is empty"
     assert os.path.isdir(data_root), "Dataset directory doesn't exist"
     assert os.listdir(data_root), "Dataset directory is empty"
@@ -197,14 +215,14 @@ def validate_train_inputs(model_name, learn_rate, cfg_scale, data_root, template
         assert log_directory, "Log directory is empty"
 
 
-def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, template_file, steps, save_embedding_every, create_image_every,
+def train_apt_embedding(embedding_name, learn_rate, cfg_scale, batch_size, data_root, template_file, steps, save_embedding_every, create_image_every,
                     classifier_path, log_directory, training_width, training_height, save_image_with_stored_embedding, preview_from_txt2img,
                     preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height):
     
     save_embedding_every = save_embedding_every or 0
     create_image_every = create_image_every or 0
 
-    validate_train_inputs(embedding_name, learn_rate, cfg_scale, data_root, template_file, steps, save_embedding_every, create_image_every, 
+    validate_train_inputs(embedding_name, learn_rate, cfg_scale, batch_size, data_root, template_file, steps, save_embedding_every, create_image_every, 
                    log_directory, embedding_name)
 
     shared.state.textinfo = "Initializing textual inversion training..."
@@ -213,13 +231,13 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, template_f
     filename = os.path.join(shared.cmd_opts.embeddings_dir, f'{embedding_name}.pt')
 
     log_directory = os.path.join(log_directory, datetime.datetime.now().strftime("%Y-%m-%d"), embedding_name)
+    unload = shared.opts.unload_models_when_training
 
     if save_embedding_every > 0:
         embedding_dir = os.path.join(log_directory, "embeddings")
         os.makedirs(embedding_dir, exist_ok=True)
     else:
         embedding_dir = None
-
 
     if create_image_every > 0:
         images_dir = os.path.join(log_directory, "images")
@@ -234,26 +252,43 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, template_f
         images_embeds_dir = None
 
     cond_model = shared.sd_model.cond_stage_model
-    unload = shared.opts.unload_models_when_training
-
-    shared.state.textinfo = f"Preparing dataset from {html.escape(data_root)}..."
-    with torch.autocast("cuda"):
-        ds = apt_dataset.PersonalizedBase(data_root=data_root, placeholder_token=embedding_name,
-                            model=shared.sd_model, device=devices.device, template_file=template_file, width=training_width, height=training_height)
-
-    if unload:
-        shared.sd_model.first_stage_model.to(devices.cpu)
 
     hijack = sd_hijack.model_hijack
 
     embedding = hijack.embedding_db.word_embeddings[embedding_name]
     embedding_uc = hijack.embedding_db.word_embeddings[embedding_name+'-uc']
+
+    checkpoint = sd_models.select_checkpoint()
+
+    ititial_step = embedding.step or 0
+    if ititial_step >= steps:
+        shared.state.textinfo = f"Model has already been trained beyond specified max steps"
+        return embedding, filename
+
+    uc_ititial_step = embedding_uc.step or 0
+    if uc_ititial_step >= steps:
+        shared.state.textinfo = f"Model(-uc) has already been trained beyond specified max steps"
+        return embedding, filename
+
     embedding.vec.requires_grad = True
     embedding_uc.vec.requires_grad = True
 
-    optimizer = torch.optim.AdamW([embedding.vec, embedding_uc.vec], lr=learn_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3000, gamma=0.3)
+    shared.state.textinfo = f"Preparing dataset from {html.escape(data_root)}..."
+    with torch.autocast("cuda"):
+        ds = apt_dataset.PersonalizedBase(
+        data_root=data_root, 
+        width=training_width, 
+        height=training_height, 
+        placeholder_token=embedding_name,
+        model=shared.sd_model, 
+        device=devices.device, 
+        template_file=template_file, 
+        repeats=shared.opts.training_image_repeats_per_epoch, 
+        batch_size=batch_size)
 
+    if unload:
+        shared.sd_model.first_stage_model.to(devices.cpu)
+    
     disc = XPDiscriminator(classifier_path) if (classifier_path is not None) and os.path.exists(classifier_path) else None
 
     if disc is not None:
@@ -261,44 +296,47 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, template_f
         ce=torch.nn.CrossEntropyLoss()
         print('use convnext discriminator')
 
+    scheduler = LearnRateScheduler(learn_rate, steps, ititial_step)
+    optimizer = torch.optim.AdamW([embedding.vec, embedding_uc.vec], lr=scheduler.learn_rate)
+    
     losses = torch.zeros((32,))
 
     last_saved_file = "<none>"
     last_saved_image = "<none>"
-
-    ititial_step = embedding.step or 0
-    if ititial_step > steps:
-        return embedding, filename
+    forced_filename = "<none>"
+    embedding_yet_to_be_embedded = False
 
     pbar = tqdm.tqdm(enumerate(ds), total=steps-ititial_step)
     for i, entries in pbar:
-        timg, x, text = entries
         embedding.step = i + ititial_step
         embedding_uc.step = i + ititial_step
 
-        if embedding.step > steps:
+        text = [entry.cond_text for entry in entries]
+        uc_text = [entry.cond_text.replace(ds.placeholder_token, ds.placeholder_token+'-uc') for entry in entries]
+
+        scheduler.apply(optimizer, embedding.step)
+        if scheduler.finished:
             break
 
         if shared.state.interrupted:
             break
 
         with torch.autocast("cuda"):
-            c = cond_model([text])
-            uc = cond_model([text.replace(ds.placeholder_token, ds.placeholder_token+'-uc')])
+            c = cond_model(text)
+            uc = cond_model(uc_text)
 
             c_in = torch.cat([uc, c])
             #print(c_in.shape)
 
-            x = x.to(devices.device)
-            output = shared.sd_model(x.unsqueeze(0), c_in, scale = cfg_scale)
-            #print(shared.sd_model)
+            x = torch.stack([entry.latent for entry in entries]).to(devices.device)
+            output = shared.sd_model(x.unsqueeze(0), c_in, cfg_scale)
+
             x_samples_ddim = shared.sd_model.decode_first_stage(output[2])
 
             if disc is not None:
-                #loss = ce(disc.get_all(x_samples_ddim), disc_label)
                 loss = (1-disc.get_score(x_samples_ddim)).mean()
             else:
-                loss = output[0] + torch_functional.l1_loss(timg, x_samples_ddim)
+                loss = output[0] + torch_functional.l1_loss(entries.timg, x_samples_ddim)
 
             del x
 
@@ -307,24 +345,26 @@ def train_embedding(embedding_name, learn_rate, cfg_scale, data_root, template_f
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            scheduler.step()
+
+        steps_done = embedding.step + 1
 
         epoch_num = embedding.step // len(ds)
         epoch_step = embedding.step % len(ds)
 
         pbar.set_description(f"[Epoch {epoch_num}: {epoch_step+1}/{len(ds)}]loss: {losses.mean():.7f}")
 
-        steps_done = embedding.step + 1
-
         if embedding_dir is not None and steps_done % save_embedding_every == 0:
-            last_saved_file = os.path.join(embedding_dir, f'{embedding_name}-{embedding.step}.pt')
-            embedding.save(last_saved_file)
-            last_saved_file = os.path.join(embedding_dir, f'{embedding_name}-uc-{embedding.step}.pt')
-            embedding_uc.save(last_saved_file)
+            # Before saving, change name to match current checkpoint.
+            embedding_name_every = f'{embedding_name}-{steps_done}'
+            embedding_uc_name_every = f'{embedding_name}-uc-{steps_done}'
+            last_saved_file = os.path.join(embedding_dir, f'{embedding_name_every}.pt')
+            save_embedding(embedding, checkpoint, embedding_name_every, last_saved_file, remove_cached_checksum=True)
+            uc_last_saved_file = os.path.join(embedding_dir, f'{embedding_uc_name_every}.pt')
+            save_embedding(embedding_uc, checkpoint, embedding_uc_name_every, uc_last_saved_file, remove_cached_checksum=True)
 
         write_loss(log_directory, "textual_inversion_loss.csv", embedding.step, len(ds), {
             "loss": f"{losses.mean():.7f}",
-            "learn_rate": scheduler.get_last_lr()
+            "learn_rate": scheduler.learn_rate
         })
 
         if images_dir is not None and steps_done % create_image_every == 0:
@@ -406,17 +446,11 @@ Last saved image: {html.escape(last_saved_image)}<br/>
 </p>
 """
 
-    checkpoint = sd_models.select_checkpoint()
+    filename = os.path.join(shared.cmd_opts.embeddings_dir, f'{embedding_name}.pt')
+    save_embedding(embedding, checkpoint, embedding_name, filename, remove_cached_checksum=True)
+    save_embedding(embedding_uc, checkpoint, embedding_name, f'{filename[:-3]}-uc.pt', remove_cached_checksum=True)
 
-    embedding.sd_checkpoint = checkpoint.hash
-    embedding.sd_checkpoint_name = checkpoint.model_name
-    embedding.cached_checksum = None
-    embedding.save(filename)
-
-    embedding_uc.sd_checkpoint = checkpoint.hash
-    embedding_uc.sd_checkpoint_name = checkpoint.model_name
-    embedding_uc.cached_checksum = None
-    embedding_uc.save(f'{filename[:-3]}-uc.pt')
+    shared.sd_model.first_stage_model.to(devices.device)     
 
     return embedding, filename
 

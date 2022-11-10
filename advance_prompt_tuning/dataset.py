@@ -9,18 +9,28 @@ from torchvision import transforms
 
 import random
 import tqdm
-from modules import devices
+from modules import devices, shared
 import re
 
-re_tag = re.compile(r"[a-zA-Z][_\w\d()]+")
+re_numbers_at_start = re.compile(r"^[-\d]+\s*")
+
+
+class DatasetEntry:
+    def __init__(self, filename=None, latent=None, filename_text=None, timg=None):
+        self.filename = filename
+        self.latent = latent
+        self.filename_text = filename_text
+        self.cond = None
+        self.cond_text = None
+        self.timg = timg
 
 
 class PersonalizedBase(Dataset):
-    def __init__(self, data_root, size=None, repeats=100, flip_p=0.5, placeholder_token="*", width=512, height=512, model=None, device=None, template_file=None):
-
+    def __init__(self, data_root, repeats=100, flip_p=0.5, placeholder_token="*", width=512, height=512, model=None, device=None, template_file=None, include_cond=False, batch_size=1):
+        re_word = re.compile(shared.opts.dataset_filename_word_regex) if len(shared.opts.dataset_filename_word_regex) > 0 else None
         self.placeholder_token = placeholder_token
 
-        self.size = size
+        self.batch_size = batch_size
         self.width = width
         self.height = height
         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
@@ -33,6 +43,10 @@ class PersonalizedBase(Dataset):
         self.lines = lines
 
         assert data_root, 'dataset directory not specified'
+        assert os.path.isdir(data_root), "Dataset directory doesn't exist"
+        assert os.listdir(data_root), "Dataset directory is empty"
+
+        cond_model = shared.sd_model.cond_stage_model
 
         TR = transforms.Compose([
             transforms.Resize(min(self.width, self.height)),
@@ -42,46 +56,71 @@ class PersonalizedBase(Dataset):
 
         self.image_paths = [os.path.join(data_root, file_path) for file_path in os.listdir(data_root)]
         print("Preparing dataset...")
-
-        imgType_list = {'jpg', 'bmp', 'png', 'jpeg', 'jfif'}
         for path in tqdm.tqdm(self.image_paths):
-            if imghdr.what(path) in imgType_list:
-                image = Image.open(path)
-                image = image.convert('RGB')
+            try:
+                image = Image.open(path).convert('RGB').resize((self.width, self.height), PIL.Image.BICUBIC)
+            except Exception:
+                continue
 
-                filename = os.path.basename(path)
-                filename_tokens = os.path.splitext(filename)[0]
-                filename_tokens = re_tag.findall(filename_tokens)
+            text_filename = os.path.splitext(path)[0] + ".txt"
+            filename = os.path.basename(path)
 
-                torchdata = (TR(image)*2.-1.).to(device=device, dtype=torch.float32)
+            if os.path.exists(text_filename):
+                with open(text_filename, "r", encoding="utf8") as file:
+                    filename_text = file.read()
+            else:
+                filename_text = os.path.splitext(filename)[0]
+                filename_text = re.sub(re_numbers_at_start, '', filename_text)
+                if re_word:
+                    tokens = re_word.findall(filename_text)
+                    filename_text = (shared.opts.dataset_filename_join_string or "").join(tokens)
 
-                timg = torchdata.unsqueeze(dim=0)
-                init_latent = model.get_first_stage_encoding(model.encode_first_stage(timg)).squeeze()
-                init_latent = init_latent.to(devices.cpu)
+            torchdata = (TR(image)*2.-1.).to(device=device, dtype=torch.float32)
+            timg = torchdata.unsqueeze(dim=0)
+            init_latent = model.get_first_stage_encoding(model.encode_first_stage(timg)).squeeze()
+            init_latent = init_latent.to(devices.cpu)
 
-                self.dataset.append((timg, init_latent, filename_tokens))
+            entry = DatasetEntry(filename=path, filename_text=filename_text, latent=init_latent, timg = timg)
 
-        self.length = len(self.dataset) * repeats
+            if include_cond:
+                entry.cond_text = self.create_text(filename_text)
+                entry.cond = cond_model([entry.cond_text]).to(devices.cpu).squeeze(0)
 
-        self.initial_indexes = np.arange(self.length) % len(self.dataset)
+            self.dataset.append(entry)
+
+        assert len(self.dataset) > 0, "No images have been found in the dataset."
+        self.length = len(self.dataset) * repeats // batch_size
+
+        self.dataset_length = len(self.dataset)
         self.indexes = None
         self.shuffle()
 
     def shuffle(self):
-        self.indexes = self.initial_indexes[torch.randperm(self.initial_indexes.shape[0])]
+        self.indexes = np.random.permutation(self.dataset_length)
+
+    def create_text(self, filename_text):
+        text = random.choice(self.lines)
+        text = text.replace("[name]", self.placeholder_token)
+        text = text.replace("[filewords]", filename_text)
+        return text
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, i):
-        if i % len(self.dataset) == 0:
-            self.shuffle()
+        res = []
 
-        index = self.indexes[i % len(self.indexes)]
-        timg, x, filename_tokens = self.dataset[index]
+        for j in range(self.batch_size):
+            position = i * self.batch_size + j
+            if position % len(self.indexes) == 0:
+                self.shuffle()
 
-        text = random.choice(self.lines)
-        text = text.replace("[name]", self.placeholder_token)
-        text = text.replace("[filewords]", ' '.join(filename_tokens))
+            index = self.indexes[position % len(self.indexes)]
+            entry = self.dataset[index]
 
-        return timg, x, text
+            if entry.cond is None:
+                entry.cond_text = self.create_text(entry.filename_text)
+
+            res.append(entry)
+
+        return res
