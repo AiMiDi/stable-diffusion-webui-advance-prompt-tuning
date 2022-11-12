@@ -164,7 +164,7 @@ class AdvancePromptTuningDatabase:
         return None, None
 
 
-def create_apt_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, use_negative, overwrite_old, init_text='*'):
+def create_apt_embedding(name, num_vectors_per_token, overwrite_old, use_negative, init_text='*'):
     cond_model = shared.sd_model.cond_stage_model
     embedding_layer = cond_model.wrapped.transformer.text_model.embeddings
 
@@ -172,18 +172,14 @@ def create_apt_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, 
         # will send cond model to GPU if lowvram/medvram is active
         cond_model([""])
 
-    ids = cond_model.tokenizer(init_text, max_length=num_vectors_per_token,
-                               return_tensors="pt", add_special_tokens=False)["input_ids"]
-    embedded = embedding_layer.token_embedding.wrapped(
-        ids.to(devices.device)).squeeze(0)
-    vec = torch.zeros(
-        (num_vectors_per_token, embedded.shape[1]), device=devices.device)
+    ids = cond_model.tokenizer(init_text, max_length=num_vectors_per_token,return_tensors="pt", add_special_tokens=False)["input_ids"]
+    embedded = embedding_layer.token_embedding.wrapped(ids.to(devices.device)).squeeze(0)
+    vec = torch.zeros((num_vectors_per_token, embedded.shape[1]), device=devices.device)
 
     for i in range(num_vectors_per_token):
         vec[i] = embedded[i * int(embedded.shape[0]) // num_vectors_per_token]
-
-    # Remove illegal characters from name.
-    name = "".join(x for x in name if (x.isalnum() or x in "._- "))
+        if use_negative:
+            vec[i] += torch.randn_like(vec[i])*1e-3
 
     fn = os.path.join(shared.cmd_opts.embeddings_dir, f"{name}.pt")
     if not overwrite_old:
@@ -193,29 +189,7 @@ def create_apt_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, 
     embedding.step = 0
     embedding.save(fn)
 
-    if use_negative:
-        uc_ids = cond_model.tokenizer(init_text, max_length=num_vectors_uc_per_token,
-                                      return_tensors="pt", add_special_tokens=False)["input_ids"]
-        uc_embedded = embedding_layer.token_embedding.wrapped(
-            uc_ids.to(devices.device)).squeeze(0)
-        uc_vec = torch.zeros(
-            (num_vectors_uc_per_token, embedded.shape[1]), device=devices.device)
-
-        for i in range(num_vectors_uc_per_token):
-            uc_vec[i] = uc_embedded[i * int(uc_embedded.shape[0]) // num_vectors_uc_per_token]
-            uc_vec[i] += torch.randn_like(vec[i])*1e-3
-
-        uc_name = name+'-uc'
-
-        uc_fn = os.path.join(shared.cmd_opts.embeddings_dir, f"{uc_name}.pt")
-        if not overwrite_old:
-            assert not os.path.exists(uc_fn), f"file {uc_fn} already exists"
-
-        uc_embedding = AdvancePromptTuning(uc_vec, uc_name)
-        uc_embedding.step = 0
-        uc_embedding.save(uc_fn)
-
-    return fn, uc_fn
+    return fn
 
 
 def validate_train_inputs(model_name, learn_rate, batch_size, data_root, template_file, steps, save_model_every, create_image_every, log_directory, cfg_scale, name="embedding"):
