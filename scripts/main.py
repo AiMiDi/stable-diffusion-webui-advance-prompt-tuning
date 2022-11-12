@@ -85,14 +85,18 @@ def create_tabs(params: UiTrainTabParams):
             fn=lambda:
             {
                 neg_lr_w: gr_show(neg_train.value)
-            }
+            },
+            inputs=[],
+            outputs=[],
         )
 
         rec_train.change(
             fn=lambda:
             {
                 rec_loss_w: gr_show(rec_train.value)
-            }
+            },
+            inputs=[],
+            outputs=[],
         )
 
         train_apt_embedding.click(

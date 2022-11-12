@@ -12,9 +12,10 @@ import datetime
 from torch.nn import functional as torch_functional
 
 from PIL import Image, PngImagePlugin
-from modules import shared, devices, sd_hijack, processing, sd_models, images
+from modules import shared, devices, sd_hijack, processing, sd_models
 import advance_prompt_tuning.dataset as apt_dataset
-from conv_next.interface import XPDiscriminator
+from advance_prompt_tuning.convnext_discriminator import XPDiscriminator
+from modules.sd_hijack_inpainting import p_sample_ddim
 from modules.textual_inversion.learn_schedule import LearnRateScheduler
 from modules.textual_inversion.textual_inversion import save_embedding, write_loss
 from modules.textual_inversion.image_embedding import embedding_from_b64, embedding_to_b64, extract_image_data_embed, insert_image_data_embed, caption_image_overlay
@@ -128,7 +129,7 @@ class AdvancePromptTuningDatabase:
             vec = emb.detach().to(devices.device, dtype=torch.float32)
             embedding = AdvancePromptTuning(vec, name)
             embedding.step = data.get('step', None)
-            embedding.sd_checkpoint = data.get('sd_checkpoint', None)
+            embedding.sd_checkpoint = data.get('hash', None)
             embedding.sd_checkpoint_name = data.get('sd_checkpoint_name', None)
             self.register_embedding(embedding, shared.sd_model)
 
@@ -187,22 +188,22 @@ def create_apt_embedding(name, num_vectors_per_token, num_vectors_uc_per_token, 
     fn = os.path.join(shared.cmd_opts.embeddings_dir, f"{name}.pt")
     if not overwrite_old:
         assert not os.path.exists(fn), f"file {fn} already exists"
-       
+
     embedding = AdvancePromptTuning(vec, name)
     embedding.step = 0
     embedding.save(fn)
 
     if use_negative:
         uc_ids = cond_model.tokenizer(init_text, max_length=num_vectors_uc_per_token,
-                                    return_tensors="pt", add_special_tokens=False)["input_ids"]
+                                      return_tensors="pt", add_special_tokens=False)["input_ids"]
         uc_embedded = embedding_layer.token_embedding.wrapped(
             uc_ids.to(devices.device)).squeeze(0)
         uc_vec = torch.zeros(
             (num_vectors_uc_per_token, embedded.shape[1]), device=devices.device)
 
         for i in range(num_vectors_uc_per_token):
-            uc_vec[i] = uc_embedded[i *
-                                    int(uc_embedded.shape[0]) // num_vectors_uc_per_token]
+            uc_vec[i] = uc_embedded[i * int(uc_embedded.shape[0]) // num_vectors_uc_per_token]
+            uc_vec[i] += torch.randn_like(vec[i])*1e-3
 
         uc_name = name+'-uc'
 
@@ -298,19 +299,18 @@ def p_losses_hook(x_start, cond, t, noise=None, scale=5.0):
 
 
 # supprot Advance Prompt Tuning by 7eu7d7 https://github.com/7eu7d7/APT-stable-diffusion-auto-prompt
-def train_apt_embedding(embedding_name, learn_rate, batch_size, data_root, log_directory, template_file, training_width, training_height, steps, create_image_every, save_embedding_every, save_image_with_stored_embedding, 
-    preview_from_txt2img, preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height, 
-    negative_scale_rate, classifier_path, use_negative, use_rec, rec_loss_w, neg_lr_w):
-    
+def train_apt_embedding(embedding_name, learn_rate, batch_size, data_root, log_directory, template_file, training_width, training_height, steps, create_image_every, save_embedding_every, save_image_with_stored_embedding,
+                        preview_from_txt2img, preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height,
+                        negative_scale_rate, classifier_path, use_negative, use_rec, rec_loss_w, neg_lr_w):
+
     save_embedding_every = save_embedding_every or 0
     create_image_every = create_image_every or 0
 
     validate_train_inputs(embedding_name, learn_rate, batch_size, data_root, template_file, steps, save_embedding_every, create_image_every,
                           log_directory, negative_scale_rate, embedding_name)
-
-    apt_sd_model = shared.sd_model
-    apt_sd_model.p_losses = p_losses_hook  # hook p_losses
-
+    # hook p_losses
+    shared.sd_model.p_losses = p_losses_hook
+    
     shared.state.textinfo = "Initializing textual inversion training..."
     shared.state.job_count = steps
 
@@ -338,16 +338,16 @@ def train_apt_embedding(embedding_name, learn_rate, batch_size, data_root, log_d
     else:
         images_embeds_dir = None
 
-    cond_model = apt_sd_model.cond_stage_model
+    cond_model = shared.sd_model.cond_stage_model
 
     shared.state.textinfo = f"Preparing dataset from {html.escape(data_root)}..."
     with torch.autocast("cuda"):
         ds = apt_dataset.PersonalizedBase(
-            data_root=data_root, 
-            width=training_width, 
+            data_root=data_root,
+            width=training_width,
             height=training_height,
             placeholder_token=embedding_name,
-            model=apt_sd_model,
+            model=shared.sd_model,
             device=devices.device,
             template_file=template_file,
             repeats=shared.opts.training_image_repeats_per_epoch,
@@ -433,11 +433,11 @@ def train_apt_embedding(embedding_name, learn_rate, batch_size, data_root, log_d
 
             x = torch.stack([entry.latent for entry in entries]).to(
                 devices.device)
-            output = apt_sd_model(x, c_in, scale=negative_scale_rate)
+            output = shared.sd_model(x, c_in, scale=negative_scale_rate)
 
             if disc is not None or use_rec:
-                x_samples_ddim = apt_sd_model.decode_first_stage.__wrapped__(
-                    apt_sd_model, output[2])  # forward with grad
+                x_samples_ddim = shared.sd_model.decode_first_stage.__wrapped__(
+                    shared.sd_model, output[2])  # forward with grad
 
             if disc is not None:
                 #loss = ce(disc.get_all(x_samples_ddim), disc_label)
@@ -483,12 +483,13 @@ def train_apt_embedding(embedding_name, learn_rate, batch_size, data_root, log_d
                 images_dir, f'{embedding_name}-{embedding.step}.png')
 
             p = processing.StableDiffusionProcessingTxt2Img(
-                sd_model=apt_sd_model,
+                sd_model=shared.sd_model,
                 prompt=preview_prompt,
                 do_not_save_grid=True,
                 do_not_save_samples=True,
                 do_not_reload_embeddings=True,
-                negative_prompt=preview_prompt.replace(ds.placeholder_token, ds.placeholder_token + '-uc') if use_negative else None,
+                negative_prompt=preview_prompt.replace(
+                    ds.placeholder_token, ds.placeholder_token + '-uc') if use_negative else None,
                 cfg_scale=negative_scale_rate if use_negative else 1.0,
             )
 
