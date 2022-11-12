@@ -21,7 +21,7 @@ def create_tabs(params: UiTrainTabParams):
                     apt_initialization_text = gr.Textbox(label="Initialization text", value="*")
                     apt_nvpt = gr.Slider( label="Number of vectors per token", minimum=1, maximum=75, step=1, value=3)
                     apt_nvucpt = gr.Slider(label="Number of negative vectors per token", minimum=1, maximum=75, step=1, value=10)
-                    apt_use_negative = gr.Checkbox(label='Use negative embedding training (APT)', value=True)
+                    apt_use_negative = gr.Checkbox(label='Use negative embedding training', value=True)
                     apt_overwrite_old_embedding = gr.Checkbox(label="Overwrite Old Embedding", value=False)
 
                     with gr.Row():
@@ -70,10 +70,10 @@ def create_tabs(params: UiTrainTabParams):
             inputs=[
                 apt_new_embedding_name,
                 apt_nvpt,
+                apt_overwrite_old_embedding,
+                apt_initialization_text,
                 apt_nvucpt,
                 apt_use_negative,
-                apt_overwrite_old_embedding,
-                apt_initialization_text
             ],
             outputs=[
                 train_apt_embedding_name,
@@ -81,22 +81,27 @@ def create_tabs(params: UiTrainTabParams):
             ]
         )
 
-        neg_train.change(
-            fn=lambda:
-            {
-                neg_lr_w: gr_show(neg_train.value)
-            },
-            inputs=[],
-            outputs=[],
+        apt_use_negative.change(
+            fn=lambda visible:
+                gr.update(visible = visible),
+            inputs=[apt_use_negative],
+            outputs=[apt_nvucpt],
         )
 
+        neg_train.change(
+            fn=lambda visible:
+                gr.update(visible = visible),
+            inputs=[neg_train],
+            outputs=[neg_lr_w],
+        )
+
+        def rec_train_change(visible):
+            return gr.update(visible = visible), gr.update(visible = visible)
+            
         rec_train.change(
-            fn=lambda:
-            {
-                rec_loss_w: gr_show(rec_train.value)
-            },
-            inputs=[],
-            outputs=[],
+            fn=rec_train_change,
+            inputs=[rec_train],
+            outputs=[rec_loss_w, disc_path],
         )
 
         train_apt_embedding.click(
